@@ -1,0 +1,423 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Galaga</title>
+<style>
+  /* Single-theme arcade screen: black CRT, white/red/blue/yellow/green sprites. */
+  :root {
+    --bg: #000000;
+    --fg: #ffffff;
+    --accent: #ffd93c;
+    --alert: #ff3c3c;
+    --info: #5ce0ff;
+    --font-ui: ui-monospace, Menlo, Consolas, "Liberation Mono", monospace;
+    color-scheme: dark;
+  }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: var(--font-ui);
+    display: flex; align-items: center; justify-content: center;
+    padding-block: 0;
+    padding-left: max(16px, env(safe-area-inset-left, 0px));
+    padding-right: max(16px, env(safe-area-inset-right, 0px));
+    box-sizing: border-box;
+    overflow: hidden;
+  }
+  canvas {
+    display: block;
+    width: min(100%, 72vh);
+    max-width: 100%;
+    height: auto;
+    image-rendering: pixelated;
+    outline: none;
+  }
+  canvas:focus-visible { box-shadow: 0 0 0 2px var(--info); }
+</style>
+</head>
+<body>
+<canvas id="game" width="480" height="640" tabindex="0" aria-label="Galaga game screen"></canvas>
+<script>
+'use strict';
+// ============================================================
+//  GALAGA - minimal browser version. One file, no dependencies.
+//  Controls: Left/Right (or A/D) move, SPACE fire, ENTER start.
+// ============================================================
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const W = canvas.width, H = canvas.height;
+const PX = 3; // screen pixels per sprite pixel
+
+// ---------- Sprites: tiny bitmaps, one character per pixel ----------
+const PALETTE = { W: '#ffffff', R: '#ff3c3c', B: '#3c7cff', Y: '#ffd93c', G: '#4cff6c' };
+
+function makeSprite(rows) {
+  const h = rows.length, w = rows[0].length;
+  const c = document.createElement('canvas');
+  c.width = w * PX; c.height = h * PX;
+  const g = c.getContext('2d');
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const ch = rows[y][x];
+      if (ch === '.') continue;
+      g.fillStyle = PALETTE[ch];
+      g.fillRect(x * PX, y * PX, PX, PX);
+    }
+  }
+  return c;
+}
+
+const SPR = {
+  player: makeSprite([
+    '......W......',
+    '......W......',
+    '.....WWW.....',
+    '.....WRW.....',
+    '..W..WRW..W..',
+    '..W.WWRWW.W..',
+    '.WWWWWWWWWWW.',
+    'WWWBBWWWBBWWW',
+    'WW.WWWWWWW.WW',
+    'W....W.W....W',
+  ]),
+  bee: makeSprite([
+    '..Y....Y..',
+    '..Y....Y..',
+    '.BBBBBBBB.',
+    'BBYBBBBYBB',
+    'BBBBBBBBBB',
+    '.B.BBBB.B.',
+    '.Y..BB..Y.',
+    '.Y......Y.',
+  ]),
+  butterfly: makeSprite([
+    'R........R',
+    '.R..WW..R.',
+    '.RRWWWWRR.',
+    'RRRRWWRRRR',
+    '.RRRRRRRR.',
+    '.R.RRRR.R.',
+    'R..R..R..R',
+    'R........R',
+  ]),
+  boss: makeSprite([
+    '.G........G.',
+    '.G.BBBBBB.G.',
+    'GGGBBBBBBGGG',
+    'GGGGBGGBGGGG',
+    '.GGGGGGGGGG.',
+    '.G.GGGGGG.G.',
+    '.G.G.GG.G.G.',
+    '.G........G.',
+  ]),
+};
+
+const ENEMY_TYPES = {
+  bee:       { score: 50,  sprite: SPR.bee,       color: PALETTE.B },
+  butterfly: { score: 80,  sprite: SPR.butterfly, color: PALETTE.R },
+  boss:      { score: 150, sprite: SPR.boss,      color: PALETTE.G },
+};
+
+// ---------- Formation layout (40 enemies, like the original) ----------
+const COLS = 10, COL_W = 38, ROW_H = 34;
+const FORM_LEFT = (W - COLS * COL_W) / 2 + COL_W / 2; // center of column 0
+const FORM_TOP = 90;
+const LAYOUT = [
+  { type: 'boss',      cols: [3, 4, 5, 6] },
+  { type: 'butterfly', cols: [1, 2, 3, 4, 5, 6, 7, 8] },
+  { type: 'butterfly', cols: [1, 2, 3, 4, 5, 6, 7, 8] },
+  { type: 'bee',       cols: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9] },
+  { type: 'bee',       cols: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9] },
+];
+
+// ---------- Input ----------
+const keys = {};
+window.addEventListener('keydown', e => {
+  if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', ' ', 'Enter'].includes(e.key)) e.preventDefault();
+  if (!e.repeat && e.key === 'Enter' && S.mode !== 'play') startGame();
+  keys[e.key] = true;
+});
+window.addEventListener('keyup', e => { keys[e.key] = false; });
+window.addEventListener('blur', () => { for (const k in keys) keys[k] = false; });
+canvas.addEventListener('pointerdown', () => canvas.focus());
+
+// ---------- Starfield ----------
+const STAR_COLORS = ['#ffffff', '#88aaff', '#ff88aa', '#aaff88', '#ffff88'];
+const stars = [];
+for (let i = 0; i < 90; i++) {
+  stars.push({ x: Math.random() * W, y: Math.random() * H, v: 20 + Math.random() * 70,
+               c: STAR_COLORS[i % STAR_COLORS.length], ph: Math.random() * 6.28 });
+}
+
+// ---------- Game state ----------
+let S = freshState();
+
+function freshState() {
+  return {
+    mode: 'title',           // title | play | over
+    time: 0,
+    score: 0, high: loadHigh(), lives: 3, wave: 0,
+    player: { x: W / 2, y: H - 70, alive: true, cool: 0, inv: 0, respawn: 0 },
+    bullets: [], ebullets: [], enemies: [], parts: [],
+    diveTimer: 0, banner: '', bannerT: 0,
+  };
+}
+
+function loadHigh() { try { return +localStorage.getItem('galaga.high') || 0; } catch (e) { return 0; } }
+function saveHigh(v) { try { localStorage.setItem('galaga.high', String(v)); } catch (e) { /* storage unavailable */ } }
+
+function startGame() {
+  const high = Math.max(S.high, S.score);
+  S = freshState();
+  S.high = high;
+  S.mode = 'play';
+  nextWave();
+}
+
+function nextWave() {
+  S.wave++;
+  S.enemies = [];
+  LAYOUT.forEach((row, r) => {
+    row.cols.forEach((c, i) => {
+      const spr = ENEMY_TYPES[row.type].sprite;
+      S.enemies.push({
+        type: row.type, row: r, col: c, w: spr.width, h: spr.height,
+        // start above the screen, staggered, and fly to the formation slot
+        x: W / 2 + (c - COLS / 2) * 20, y: -40 - r * 50 - i * 12,
+        state: 'return', t: 0,
+      });
+    });
+  });
+  S.banner = 'STAGE ' + S.wave; S.bannerT = 2;
+  S.diveTimer = 3;
+  S.bullets = []; S.ebullets = [];
+}
+
+function slotOf(e) {
+  const sway = Math.sin(S.time * 0.9) * 36;
+  return { x: FORM_LEFT + e.col * COL_W + sway, y: FORM_TOP + e.row * ROW_H };
+}
+
+// Axis-aligned box overlap, boxes given by center + size.
+function hit(ax, ay, aw, ah, bx, by, bw, bh) {
+  return Math.abs(ax - bx) * 2 < aw + bw && Math.abs(ay - by) * 2 < ah + bh;
+}
+
+function explode(x, y, color, n = 12) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2, v = 60 + Math.random() * 160;
+    S.parts.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, life: 0.4 + Math.random() * 0.3, c: color });
+  }
+}
+
+function fireEnemy(e) {
+  const P = S.player;
+  const dx = P.x - e.x, dy = P.y - e.y, d = Math.hypot(dx, dy) || 1, sp = 230;
+  S.ebullets.push({ x: e.x, y: e.y + 8, vx: dx / d * sp, vy: dy / d * sp });
+}
+
+function killPlayer() {
+  const P = S.player;
+  P.alive = false; P.respawn = 2.2; S.lives--;
+  explode(P.x, P.y, PALETTE.W, 24);
+  S.ebullets = [];
+  for (const e of S.enemies) if (e.state === 'dive') e.state = 'return';
+}
+
+// ---------- Update ----------
+function update(dt) {
+  S.time += dt;
+  for (const s of stars) { s.y += s.v * dt; if (s.y > H) { s.y = 0; s.x = Math.random() * W; } }
+  for (const p of S.parts) { p.x += p.vx * dt; p.y += p.vy * dt; p.life -= dt; }
+  S.parts = S.parts.filter(p => p.life > 0);
+  if (S.mode === 'play') updatePlay(dt);
+}
+
+function updatePlay(dt) {
+  const P = S.player;
+  if (S.bannerT > 0) S.bannerT -= dt;
+
+  // --- player ---
+  if (P.alive) {
+    const left = keys['ArrowLeft'] || keys['a'] || keys['A'];
+    const right = keys['ArrowRight'] || keys['d'] || keys['D'];
+    if (left) P.x -= 260 * dt;
+    if (right) P.x += 260 * dt;
+    P.x = Math.max(24, Math.min(W - 24, P.x));
+    P.cool -= dt; P.inv -= dt;
+    if (keys[' '] && P.cool <= 0 && S.bullets.length < 2) {   // two shots on screen, like the arcade
+      S.bullets.push({ x: P.x, y: P.y - 16 });
+      P.cool = 0.2;
+    }
+  } else {
+    P.respawn -= dt;
+    if (P.respawn <= 0) {
+      if (S.lives > 0) { P.alive = true; P.x = W / 2; P.inv = 2; }
+      else { S.mode = 'over'; if (S.score > S.high) { S.high = S.score; saveHigh(S.high); } }
+    }
+  }
+
+  // --- player bullets ---
+  for (const b of S.bullets) b.y -= 560 * dt;
+  S.bullets = S.bullets.filter(b => b.y > -20);
+
+  // --- enemies ---
+  for (const e of S.enemies) {
+    const slot = slotOf(e);
+    if (e.state === 'form') {
+      e.x = slot.x; e.y = slot.y;
+    } else if (e.state === 'return') {
+      const dx = slot.x - e.x, dy = slot.y - e.y, d = Math.hypot(dx, dy), step = 300 * dt;
+      if (d <= step) { e.x = slot.x; e.y = slot.y; e.state = 'form'; }
+      else { e.x += dx / d * step; e.y += dy / d * step; }
+    } else if (e.state === 'dive') {
+      e.t += dt;
+      const t = e.t;
+      const lean = Math.min(1, t / 2) * (P.x - e.x0) * 0.6;          // drift toward the player's lane
+      e.x = Math.max(16, Math.min(W - 16, e.x0 + Math.sin(t * 2.4) * e.dir * 120 + lean));
+      e.y = e.y0 + 80 * t + 70 * t * t;                              // accelerating swoop
+      e.shot -= dt;
+      if (e.shots > 0 && e.shot <= 0 && e.y > 0 && e.y < P.y - 100 && P.alive) {
+        fireEnemy(e); e.shots--; e.shot = 0.45;
+      }
+      if (e.y > H + 30) { e.state = 'return'; e.x = slot.x; e.y = -40; }   // loop around and rejoin
+    }
+  }
+
+  // --- dive scheduling ---
+  if (S.bannerT <= 0 && P.alive) {
+    S.diveTimer -= dt;
+    if (S.diveTimer <= 0) {
+      const maxDivers = Math.min(1 + Math.floor((S.wave - 1) / 2), 4);
+      const diving = S.enemies.filter(e => e.state === 'dive').length;
+      const ready = S.enemies.filter(e => e.state === 'form');
+      if (diving < maxDivers && ready.length) {
+        const e = ready[Math.floor(Math.random() * ready.length)];
+        e.state = 'dive'; e.t = 0; e.x0 = e.x; e.y0 = e.y;
+        e.dir = e.x < W / 2 ? 1 : -1;
+        e.shots = 2; e.shot = 0.3 + Math.random() * 0.4;
+      }
+      S.diveTimer = Math.max(0.5, 2.0 - S.wave * 0.12);
+    }
+  }
+
+  // --- enemy bullets ---
+  for (const b of S.ebullets) { b.x += b.vx * dt; b.y += b.vy * dt; }
+  S.ebullets = S.ebullets.filter(b => b.y < H + 20 && b.x > -20 && b.x < W + 20);
+
+  // --- player bullets vs enemies ---
+  for (const b of S.bullets) {
+    for (const e of S.enemies) {
+      if (!e.dead && hit(b.x, b.y, 4, 12, e.x, e.y, e.w * 0.8, e.h * 0.8)) {
+        e.dead = true; b.dead = true;
+        const base = ENEMY_TYPES[e.type].score;
+        S.score += e.state === 'dive' ? base * 2 : base;   // divers are worth double
+        explode(e.x, e.y, ENEMY_TYPES[e.type].color);
+        break;
+      }
+    }
+  }
+  S.bullets = S.bullets.filter(b => !b.dead);
+
+  // --- enemies and enemy bullets vs player ---
+  if (P.alive && P.inv <= 0) {
+    const shot = S.ebullets.some(b => hit(b.x, b.y, 4, 10, P.x, P.y, 26, 24));
+    const crash = S.enemies.find(e => !e.dead && e.state === 'dive' && hit(e.x, e.y, e.w * 0.7, e.h * 0.7, P.x, P.y, 26, 24));
+    if (crash) { crash.dead = true; explode(crash.x, crash.y, ENEMY_TYPES[crash.type].color); }
+    if (shot || crash) killPlayer();
+  }
+  S.enemies = S.enemies.filter(e => !e.dead);
+
+  // --- stage clear ---
+  if (S.enemies.length === 0) nextWave();
+}
+
+// ---------- Draw ----------
+function text(str, x, y, size, color, align = 'center') {
+  ctx.font = 'bold ' + size + 'px ' + 'ui-monospace, Menlo, Consolas, "Liberation Mono", monospace';
+  ctx.fillStyle = color; ctx.textAlign = align; ctx.textBaseline = 'middle';
+  ctx.fillText(str, x, y);
+}
+
+function drawSprite(spr, x, y) {
+  ctx.drawImage(spr, Math.round(x - spr.width / 2), Math.round(y - spr.height / 2));
+}
+
+function pad(n) { return String(n).padStart(6, '0'); }
+
+function draw() {
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+  for (const s of stars) {
+    ctx.globalAlpha = 0.4 + 0.6 * Math.abs(Math.sin(S.time * 2 + s.ph));
+    ctx.fillStyle = s.c; ctx.fillRect(s.x, s.y, 2, 2);
+  }
+  ctx.globalAlpha = 1;
+
+  if (S.mode === 'title') { drawTitle(); return; }
+
+  for (const e of S.enemies) drawSprite(ENEMY_TYPES[e.type].sprite, e.x, e.y);
+
+  const P = S.player;
+  if (P.alive && (P.inv <= 0 || Math.floor(S.time * 12) % 2 === 0)) drawSprite(SPR.player, P.x, P.y);
+
+  ctx.fillStyle = PALETTE.W;
+  for (const b of S.bullets) ctx.fillRect(b.x - 1.5, b.y - 6, 3, 12);
+  ctx.fillStyle = '#ff6666';
+  for (const b of S.ebullets) ctx.fillRect(b.x - 2, b.y - 5, 4, 10);
+
+  for (const p of S.parts) {
+    ctx.globalAlpha = Math.min(1, p.life * 2); ctx.fillStyle = p.c; ctx.fillRect(p.x - 2, p.y - 2, 4, 4);
+  }
+  ctx.globalAlpha = 1;
+
+  drawHUD();
+  if (S.bannerT > 0) text(S.banner, W / 2, H / 2, 28, '#5ce0ff');
+  if (S.mode === 'over') {
+    text('GAME OVER', W / 2, H / 2 - 10, 32, PALETTE.R);
+    if (Math.floor(S.time * 2) % 2 === 0) text('PRESS ENTER', W / 2, H / 2 + 30, 16, PALETTE.W);
+  }
+}
+
+function drawHUD() {
+  text('1UP', 20, 16, 14, PALETTE.R, 'left');
+  text(pad(S.score), 20, 34, 14, PALETTE.W, 'left');
+  text('HIGH SCORE', W - 20, 16, 14, PALETTE.R, 'right');
+  text(pad(S.high), W - 20, 34, 14, PALETTE.W, 'right');
+  for (let i = 0; i < S.lives - 1; i++) ctx.drawImage(SPR.player, 12 + i * 28, H - 32, 26, 20);
+  text('STAGE ' + S.wave, W - 20, H - 20, 14, '#5ce0ff', 'right');
+}
+
+function drawTitle() {
+  text('GALAGA', W / 2, H / 2 - 110, 48, PALETTE.Y);
+  if (Math.floor(S.time * 2) % 2 === 0) text('PRESS ENTER TO START', W / 2, H / 2 - 40, 18, PALETTE.W);
+  text('LEFT / RIGHT  MOVE        SPACE  FIRE', W / 2, H / 2, 13, '#aaaaaa');
+  const rows = [['bee', '50'], ['butterfly', '80'], ['boss', '150']];
+  rows.forEach(([type, pts], i) => {
+    const y = H / 2 + 60 + i * 40;
+    drawSprite(ENEMY_TYPES[type].sprite, W / 2 - 60, y);
+    text(pts + ' PTS', W / 2 - 20, y, 14, PALETTE.W, 'left');
+  });
+  text('HIGH SCORE  ' + pad(S.high), W / 2, H - 60, 14, PALETTE.R);
+  text('click the screen first if keys do nothing', W / 2, H - 28, 11, '#666666');
+}
+
+// ---------- Main loop ----------
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000);   // clamp so a background tab does not teleport everything
+  last = now;
+  update(dt);
+  draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+canvas.focus();
+
+// Small debug handle for automated tests.
+window.GALAGA = { get state() { return S; } };
+</script>
+</body>
+</html>
